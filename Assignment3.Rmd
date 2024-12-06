@@ -1,0 +1,168 @@
+---
+title: "Assignment3"
+output: pdf_document
+date: "2024-11-13"
+---
+Step 1: Stimulating some data
+1. set arbitrary values:
+drift rate: 0
+boundary separation: 1.5
+nondecision time: 0.3
+2. these values will be the population mean for each EZ-DDM parameter
+```{r}
+drift_mean<- 0
+bound_mean<- 1.5
+nondt_mean<- 0.3
+```
+3. build a function that generates the individual-level parameters 
+```{r}
+generate_individual_parameters<-function(n_Participants, drift_mean, bound_mean, nondt_mean){
+  drift_sd<-1
+  bound_sd<-0.5
+  nondt_sd<-0.1
+  drift_rate<- rnorm(n_Participants, mean=drift_mean, sd=drift_sd)
+  bound_values<- rnorm(n_Participants, mean=bound_mean, sd=bound_sd)
+  nondt_values<- rnorm(n_Participants, mean=nondt_mean, sd=nondt_sd)
+data.frame(Participant = 1:n_Participants, drift_rate, bound_values, nondt_values)
+}
+
+```
+4. Build a function that generates summary stats 
+```{r}
+summary_stats<- function(individual_parameter, n_trials){
+  
+  a<-individual_parameter$bound_values
+  v<-individual_parameter$drift_rate
+  t<-individual_parameter$nondt_values
+  
+  #equation 1
+  A_pred_mean<- 1 / (1 + exp(-a * v))
+  #equation 2
+  RT_pred_mean<-t + ((a / (2 * v^3 )) * ((exp(-a * v) - 1) / (exp(-a * v) + 1)))
+  #equation 3
+  RT_pred_var <- (a / (2 * v^3)) * (-2 * a * v * exp(-a * v) - exp(-2 * a * v) + 1) / (exp(-a * v) + 1)^2
+
+  #equation 4
+  A_obs_total <- rbinom(length(A_pred_mean), size = n_trials, prob = A_pred_mean)
+  #equation 5
+  RT_obs_mean <- rnorm(length(RT_pred_mean), mean=RT_pred_mean, sd=sqrt((RT_pred_var/n_trials)))
+  #equation 6
+  RT_obs_var <- rnorm(length(RT_pred_var), mean=RT_pred_var, sd = sqrt((2*RT_pred_var^2)/(n_trials-1)))
+  
+ data.frame(Participant = individual_parameter$Participant, A_pred_mean, RT_pred_mean, RT_pred_var, A_obs_total, RT_obs_mean, RT_obs_var)
+  }
+```
+5. test using 50 participants and 150 trials each
+```{r}
+set.seed(202)
+n_Participants<-80
+n_trials<-200
+
+indiv_parameters<-generate_individual_parameters(n_Participants, drift_mean, bound_mean, nondt_mean)
+
+summary_table<- summary_stats(indiv_parameters, n_trials)
+
+
+```
+
+
+Step 2:
+JAGS module 
+```{r}
+
+write("
+model {
+  bound_mean ~ dnorm(1.5, pow(0.05, -2))T(0.1, 5.0)  
+  nondt_mean ~ dnorm(0.3, pow(0.02, -2))T(0.1, 0.6) 
+  drift_mean ~ dnorm(0, pow(0.5, -2))T(-5.0, 5.0)    
+  bound_sdev ~ dunif(0.1, 1)    
+  nondt_sdev ~ dunif(0.05, 0.5)   
+  drift_sdev ~ dunif(0.1, 1.5) 
+
+  # Sampling model
+  for (p in 1:n_Participants) {
+    bound[p] ~ dnorm(bound_mean, pow(bound_sdev, -2))T(0.10, 5.00)
+    nondt[p] ~ dnorm(nondt_mean, pow(nondt_sdev, -2))T(0.05,)
+    drift[p] ~ dnorm(drift_mean, pow(drift_sdev, -2))T(-5.00, 5.00)
+
+    # Forward equations from EZ Diffusion
+    ey[p] = exp(-bound[p] * drift[p])
+    Pc[p] = 1 / (1 + ey[p])
+    PRT[p] = 2*pow(drift[p],3)/bound[p]*pow(ey[p] + 1, 2)/(2 *-bound[p]*              drift[p] * ey[p] - ey[p]*ey[p]+1)
+    MDT[p] = (bound[p] / (2 * drift[p])) * (1 - ey[p]) / (1 + ey[p])
+    MRT[p] = MDT[p] + nondt[p]
+
+    # Loss functions using MRT, PRT, and Pc
+    correct[p] ~ dbin(Pc[p], n_trials)
+    meanRT[p] ~ dnorm(MRT[p], PRT[p] * n_trials)
+    varRT[p] ~ dnorm(1 / PRT[p], 0.5 * (n_trials - 1) * PRT[p] * PRT[p])
+  }
+}
+", "./model.bug")
+
+
+```
+
+Step 3: JAGS set-up
+```{r}
+parameters<-c("drift_mean", "bound_mean", "nondt_mean")
+n.iter<-1500
+n.chains<-4
+n.burnin<-500
+n.thin<-1
+
+data_toJAGS<- list(correct=summary_table$A_obs_total,
+                   meanRT=summary_table$RT_obs_mean,
+                   varRT=summary_table$RT_obs_var,
+                   n_Participants=n_Participants,
+                   n_trials=n_trials 
+)
+
+myinits<-rep(list(list()), n.chains)
+set.seed(202)
+for(i in 1:n.chains){
+  myinits[[i]]<- list(drift=rnorm(n_Participants, 0, 0.5))
+  
+}
+
+```
+Step 4: Run JAGS
+```{r}
+library(rjags)
+library(coda)
+library(R2jags)
+samples <- jags(data = data_toJAGS, parameters.to.save = parameters,
+                model= "./model.bug",
+                n.chains = n.chains, n.iter = 1000,
+                n.burnin = 100, n.thin = n.thin,DIC = T, inits = myinits)
+```
+
+step 6: graph
+
+```{r}
+
+library(ggplot2)
+drift_mean_samples <- as.vector(samples$BUGSoutput$sims.array[,, "drift_mean"])
+bound_mean_samples <- as.vector(samples$BUGSoutput$sims.array[,, "bound_mean"])
+nondt_mean_samples <- as.vector(samples$BUGSoutput$sims.array[,, "nondt_mean"])
+
+posterior_data <- data.frame(
+  drift_mean = drift_mean_samples,
+  bound_mean = bound_mean_samples,
+  nondt_mean = nondt_mean_samples
+)
+
+ggplot(posterior_data, aes(x = drift_mean))+
+  geom_density(fill = "skyblue", alpha = 0.6) +
+  labs(title = "Posterior Distribution of Drift Mean", x = "Drift Mean", y = "Density") + geom_vline(xintercept =0 , color = "red")
+ggplot(posterior_data, aes(x = bound_mean))+
+  geom_density(fill = "pink", alpha = 0.6) +
+  labs(title = "Posterior Distribution of Bound Mean", x = "Bound Mean", y = "Density") + geom_vline(xintercept =1.5 , color = "red")
+ggplot(posterior_data, aes(x = nondt_mean))+
+  geom_density(fill = "purple", alpha = 0.6) +
+  labs(title = "Posterior Distribution of NonDt Mean", x = "NonDt Mean", y = "Density") + geom_vline(xintercept =0.3 , color = "red")
+
+```
+
+
+
