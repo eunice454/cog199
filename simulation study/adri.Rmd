@@ -1,0 +1,100 @@
+---
+title: "Untitled"
+author: "Adriana Chavez"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+drift_mean <- 0
+bound_mean <- 2
+nondt_mean <- 0.4
+```
+
+```{r}
+getIndPar <- function(n, dmean, bmean, nmean){
+  d <- rnorm(n, dmean, 1)
+  b <- rnorm(n, bmean, 0.5)
+  n <- rnorm(n, nmean, 0.15)
+  return(data.frame("bound" = b, "drift" = d, "nondt" = n))
+}
+
+simSumStats <- function(d,b,nt,N){
+  nP <- length(d)
+  y <- exp(-b * d)
+  # Forward EZ equations
+  PredAccuracyRate <- 1 / (y + 1)  # Equation 1
+  PredMean <- nt + (b / (2 * d)) * ((y - 1) / (y + 1))  # Equation 2
+  PredVariance <- (b / (2 * d^3)) * ((1 - 2 * b * d * y - y^2) / ((y + 1)^2))  # Equation 3
+  # Samplers
+  ObservedAccuracyTotal <- rbinom(nP, size = N, prob = PredAccuracyRate)
+  # Random sampler for ObservedMean
+  ObservedMean <- rnorm(nP, mean = PredMean, sd = sqrt(PredVariance / N))
+  # Random sampler for ObservedVariance
+  ObservedVariance <- rnorm(nP, mean = PredVariance, sd = sqrt((2 * (PredVariance^2)) / (N - 1)))
+
+  
+  return(data.frame("A" = ObservedAccuracyTotal, 
+                    "Mrt" = ObservedMean, 
+                    "Vrt" = ObservedVariance))
+}
+```
+
+```{r}
+write("
+    model {
+      bound_mean ~ dnorm(1.5, pow(0.4, -2))T(0.10, 5.00)
+      nondt_mean ~ dnorm(0.3, pow(0.05, -2))T(0.05, 1.0)
+      drift_mean ~ dnorm(0, pow(0.5, -2))T(-5.00, 5.00)
+    
+      bound_sdev ~ dunif(0.05, 0.5)
+      nondt_sdev ~ dunif(0.05, 2)
+      drift_sdev ~ dunif(0.05, 2)
+    
+      # Sampling model
+      for (p in 1:n_Participants) {
+        bound[p] ~ dnorm(bound_mean, pow(bound_sdev, -2))T(0.10, 5.00)
+        nondt[p] ~ dnorm(nondt_mean, pow(nondt_sdev, -2))T(0.05, 1.0)
+        drift[p] ~ dnorm(drift_mean, pow(drift_sdev, -2))T(-5.00, 5.00)
+    
+        # Forward equations from EZ Diffusion
+        ey[p] = exp(-bound[p] * drift[p])
+        Pc[p] = 1 / (1 + ey[p])
+        PRT[p] = 2 * pow(drift[p], 3) / bound[p] * pow(ey[p] + 1, 2) / (2 * -bound[p] * drift[p] * ey[p] - pow(ey[p], 2) + 1)
+        MDT[p] = (bound[p] / (2 * drift[p])) * (1 - ey[p]) / (1 + ey[p])
+        MRT[p] = MDT[p] + nondt[p]
+    
+        # Loss functions using MRT, PRT, and Pc
+        correct[p] ~ dbin(Pc[p], n_trials)
+        meanRT[p] ~ dnorm(MRT[p], PRT[p] * n_trials)
+        varRT[p] ~ dnorm(1 / PRT[p], 0.5 * (n_trials - 1) * PRT[p] * PRT[p])
+      }
+    }
+", "./model.bug")
+```
+
+```{r}
+par <- getIndPar(n=40,dmean = drift_mean, bmean = bound_mean, nmean = nondt_mean)
+
+ez_data <- simSumStats(d=par$drift, b=par$bound, nt=par$nondt, N = 150)
+```
+
+```{r}
+library(R2jags)
+
+samples <- jags(data=list(n_Participants = ), 
+                parameters.to.save=c("drift_mean", "bound_mean", "beta_mean"), 
+                model=modelFile, 
+                n.chains=n.chains, 
+                n.iter=n.iter, 
+                n.burnin=n.burnin, 
+                n.thin=n.thin, 
+                DIC=T, 
+                inits=jagsInits)
+
+
+```
