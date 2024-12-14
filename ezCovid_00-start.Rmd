@@ -36,17 +36,67 @@ There are 36 columns in our dataset. This means that for each trial, we have inf
 
 # Step 1: Clean the data
 
+
 1. How many trials do we have per participant? Do we have the same number of trials per participant? **Make a histogram for the number of trials per participants**.
+```{r}
+num_trials<- as.data.frame(table(data$participant_id))
+
+colnames(num_trials) <- c("Participant", "trials")
+
+hist(num_trials$trials)
+
+```
+The number of trials is different for each participant. 
 
 You should see there seems to be 1 participant that was fewer trials than anybody else in the experiment. **What is the ID of this participant?** Once you have identified them **Remove all trials from this participant from the dataset**.
+```{r}
+min_trials <- min(num_trials$trials)
+participant_remove<- num_trials$Participant[num_trials$trials == min_trials]
+
+cat("Participant with the fewest trials:", participant_remove, "\n")
+cleanData <- data[data$participant_id != participant_remove, c("participant_id", "response_time", "accuracy", "covid")]
+
+
+```
 
 2. Now, let's look at the distribution of response times. **Make a histogram for all the response times observed in the experiment**.
+```{r}
+hist(cleanData$response_time)
+
+```
+
 
 You should find that most response times are smaller than 4500ms, but there's a few outliers. **Remove trials with a RT larger than 4500ms in the dataset**.
 
+```{r}
+filteredData<- cleanData[cleanData$response_time<=4500, ]
+hist(filteredData$response_time)
+```
+
+
 3. Finally, let's look at how well participants did in the task. For this, we'll focus on the **accuracy rate** (that is, the proportion of correct responses each participant made during the experiment). **Compute the accuracy rates per participant, and show their distribution in a histogram**.
 
+```{r}
+accuracyRate <- aggregate(accuracy ~ participant_id, data = filteredData, 
+                           function(x) sum(x) / length(x))
+hist(accuracyRate$accuracy)
+```
+
 You should see that most participants had an accuracy rate of at least $70\%$. There's one participant who is the exception. **What is the ID for the participant with the lowest accuracy rate?** Once you have identified them, **remove all trials belonging to this participant from the dataset**.
+```{r}
+min_accuracy<-min(accuracyRate$accuracy)
+participant_remove2<- accuracyRate$participant_id[accuracyRate$accuracy==min_accuracy]
+
+filteredData <- cleanData[cleanData$participant_id != participant_remove2 & cleanData$response_time <= 4500, ]
+
+filteredData$response_time <- filteredData$response_time / 1000
+
+
+cat("Participant with the fewest trials:", participant_remove2, "\n")
+
+unique(filteredData$participant_id) ##check if 4062, 4010 was removed
+
+```
 
 # Step 2: Computing EZ summary statistics
 
@@ -54,11 +104,43 @@ You should see that most participants had an accuracy rate of at least $70\%$. T
     - **Compute the Accuracy rate per participant**
     - **Compute the Mean RT per participant**
     - **Compute the Variance RT per participant**
-
 2. We will also need to keep track of the number of trials observed for each participant to compute the variances of the generative distributions.
     - **Compute the number of trials per participant**
+```{r}
+
+accuracy_rate <- aggregate(accuracy ~ participant_id, data = filteredData, function(x) sum(x) / length(x))
+
+mean_rt <- aggregate(response_time ~ participant_id, data = filteredData, mean)
+
+variance_rt <- aggregate(response_time ~ participant_id, data = filteredData, var)
+
+num_trials <- aggregate(response_time ~ participant_id, data = filteredData, length)
+colnames(num_trials) <- c("participant_id", "num_trials")
+
+correct<-tapply(filteredData$accuracy, filteredData$participant_id, sum)
+
+summary_stats <- data.frame(
+  Participant = accuracy_rate$participant_id,
+  Accuracy_Rate = accuracy_rate$accuracy,
+  correct=correct,
+  Mean_RT = mean_rt$response_time,
+  Variance_RT = variance_rt$response_time,
+  Num_Trials = num_trials$num_trials
+)
+
+
+```
+
+
+
+```{r}
+
+```
 
 3. We will need this to run our JAGS model: How many participants are there? **Create a variable storing the number of participants in the experiment**.
+```{r}
+n_Participants <- nrow(summary_stats)
+```
 
 
 # Step 2: Prepare JAGS!
@@ -67,19 +149,113 @@ You should see that most participants had an accuracy rate of at least $70\%$. T
 
 *Note:* This time we have no way of knowing which would be the "true parameter values" generating the data observed. We may need to change the priors we use for `drift_mean`, `drift_sdev`, `bound_mean`, `bound_sdev` and `nondt_mean`, `nondt_sdev`. Keep this in mind when running JAGS and exploring the posterior distributions requested.
 
+```{r}
+write("
+model {
+  bound_mean ~ dnorm(1.5, 0.01)T(0.1, ) 
+  nondt_mean ~ dnorm(0.3, 0.01)T(0.05,) 
+  drift_mean ~ dnorm(0, 0.0025)
+  bound_sdev ~ dunif(0.1, 2)                
+  nondt_sdev ~ dunif(0.05, 1)               
+  drift_sdev ~ dunif(0.1, 3)                
+
+  # Sampling model
+  for (p in 1:n_Participants) {
+    bound[p] ~ dnorm(bound_mean, pow(bound_sdev, -2))T(0.10,)
+    nondt[p] ~ dnorm(nondt_mean, pow(nondt_sdev, -2))T(0.05, )
+    drift[p] ~ dnorm(drift_mean, pow(drift_sdev, -2))
+
+    # Forward equations from EZ Diffusion
+    ey[p] = exp(-bound[p] * drift[p])
+    Pc[p] = 1 / (1 + ey[p])
+    PRT[p] = 2*pow(drift[p],3)/bound[p]*pow(ey[p] + 1, 2)/(2 *-bound[p]*drift[p] * ey[p] - ey[p]*ey[p]+1)
+    MDT[p] = (bound[p] / (2 * drift[p])) * (1 - ey[p]) / (1 + ey[p])
+    MRT[p] = MDT[p] + nondt[p]
+
+    # Loss functions using MRT, PRT, and Pc
+    correct[p] ~ dbin(Pc[p], n_trials[p])
+    meanRT[p] ~ dnorm(MRT[p], PRT[p] * n_trials[p])
+    varRT[p] ~ dnorm(1 / PRT[p], 0.5 * (n_trials[p] - 1) * PRT[p] * PRT[p])
+  }
+}
+", "./model.bug")
+
+
+```
+
+
 2. Create a `parameters` object that specifies which parameters we want to track.
+```{r}
+parameters<-c("drift_mean", "bound_mean", "nondt_mean")
+
+```
 
 3. Define `n.chains`, `n.iter`, `n.burnin` and `n.thin`.
+```{r}
+n.iter<-5000
+n.chains<-4
+n.burnin<-1000
+n.thin<-3
+```
+
 
 4. Create a `data_toJAGS` object. This must be a list pairing the summary statistics you computed on the last step, to the variables used or referred in the JAGS model.
+```{r}
+data_toJAGS<- list(correct=summary_stats$correct,
+                   meanRT=summary_stats$Mean_RT,
+                   varRT=summary_stats$Variance_RT,
+                   n_Participants=n_Participants,
+                   n_trials=num_trials$num_trials 
+)
+
+```
 
 5. Create a `myinits` object.
 
 # Step 4: RUN JAGS
-
 Run your JAGS model using the `jags()` function! Make sure to load all necessary information and settings.
+```{r}
+
+myinits<-rep(list(list()), n.chains)
+for(i in 1:n.chains){
+  myinits[[i]]<- list(drift=rnorm(n_Participants, 0, 0.5))
+  
+}
+
+library(rjags)
+library(coda)
+library(R2jags)
+samples <- jags(data = data_toJAGS, parameters.to.save = parameters,
+                model= "./model.bug",
+                n.chains = n.chains, n.iter = 1000,
+                n.burnin = 100, n.thin = n.thin,DIC = T, inits = myinits)
+```
+
 
 # Results
 
 1. Plot the posterior distributions for `drift_mean`, `nondt_mean` and `bound_mean`.
+
+```{r}
+library(ggplot2)
+drift_mean_samples <- as.vector(samples$BUGSoutput$sims.array[,, "drift_mean"])
+bound_mean_samples <- as.vector(samples$BUGSoutput$sims.array[,, "bound_mean"])
+nondt_mean_samples <- as.vector(samples$BUGSoutput$sims.array[,, "nondt_mean"])
+
+posterior_data <- data.frame(
+  drift_mean = drift_mean_samples,
+  bound_mean = bound_mean_samples,
+  nondt_mean = nondt_mean_samples
+)
+
+ggplot(posterior_data, aes(x = drift_mean))+
+  geom_density(fill = "skyblue", alpha = 0.6) +
+  labs(title = "Posterior Distribution of Drift Mean", x = "Drift Mean", y = "Density") 
+ggplot(posterior_data, aes(x = bound_mean))+
+  geom_density(fill = "pink", alpha = 0.6) +
+  labs(title = "Posterior Distribution of Bound Mean", x = "Bound Mean", y = "Density") 
+ggplot(posterior_data, aes(x = nondt_mean))+
+  geom_density(fill = "purple", alpha = 0.6) +
+  labs(title = "Posterior Distribution of NonDt Mean", x = "NonDt Mean", y = "Density") 
+```
 
